@@ -1,0 +1,112 @@
+name: Release build and stage deploy
+on:
+  push:
+    branches:
+      - release/*
+      - main
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repositories
+        uses: actions/checkout@v2
+
+      - name: Get project name
+        id: project-name
+        run: |
+          repo=${{ github.repository }}
+          image=$(basename "$repo")
+          echo "image=$image" >> $GITHUB_OUTPUT
+
+      - name: get-npm-version
+        id: package-version
+        uses: martinbeentjes/npm-get-version-action@main
+
+      - name: Set short sha
+        id: vars
+        run: echo "sha_short=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+
+      - uses: mukunku/tag-exists-action@v1.6.0
+        id: check-tag
+        with:
+          tag: v${{ steps.package-version.outputs.current-version }}
+
+    outputs:
+      version: ${{ steps.package-version.outputs.current-version }}
+      image: ${{ steps.project-name.outputs.image }}
+      exists: ${{ steps.check-tag.outputs.exists }}
+
+  build:
+    if: needs.prepare.outputs.exists != 'true'
+    needs: prepare
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+
+    steps:
+      - name: Checkout Repositories
+        uses: actions/checkout@v2
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: cn-northwest-1
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+
+      - name: Setup NodeJS
+        uses: actions/setup-node@v1
+        with:
+          node-version: 22.x
+          registry-url: https://npm.pkg.github.com/
+          scope: '@juzibot'
+
+      - name: Setup @juzibot npm auth
+        run: |
+          echo "//npm.pkg.github.com/:_authToken=${{ secrets.JUZI_NPM_TOKEN }}" > ~/.npmrc
+
+      - name: NPM install
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.JUZI_NPM_TOKEN }}
+        run: |
+          npm i --libc=musl --ignore-scripts=false
+          sudo chown -R $USER ./node_modules
+
+      - name: Build, tag, and push image to Amazon ECR
+        id: build-image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: my-ecr-repo
+          PACKAGE_VERSION: ${{ needs.prepare.outputs.version }}
+          ARCH: ${{ matrix.arch }}
+          IMAGE_NAME: ${{ needs.prepare.outputs.image }}
+        run: |
+          npm run docker-ci
+
+  push-and-deploy:
+    needs:
+      - prepare
+      - build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repositories
+        uses: actions/checkout@v2
+
+      - name: Create tag
+        uses: actions/github-script@v5
+        with:
+          script: |
+            github.rest.git.createRef({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              ref: 'refs/tags/v${{ needs.prepare.outputs.version }}',
+              sha: context.sha
+            })
